@@ -8,7 +8,7 @@ A complete end-to-end encrypted local mailing system delivered as a single PHP f
 
 ## 🎯 Project Overview
 
-**xsukax E2EE Local Mailing System** is a self-contained, privacy-focused email application designed for organizations and individuals who require secure internal communications without relying on third-party email providers. The entire system—including the web interface, API endpoints, and database management—is encapsulated in a single `index.php` file, making deployment remarkably simple.
+**xsukax E2EE Local Mailing System** is a self-contained, privacy-focused email application designed for organizations and individuals who require secure internal communications without relying on third-party email providers. The entire system—including the web interface, API endpoints, and database management - is encapsulated in a single `index.php` file, making deployment remarkably simple.
 
 ### Core Capabilities
 
