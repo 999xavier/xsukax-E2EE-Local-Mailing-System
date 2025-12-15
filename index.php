@@ -143,23 +143,7 @@ function successResponse($data = []) {
 // ============================================================================
 
 $requestMethod = $_SERVER['REQUEST_METHOD'];
-$requestUri = $_SERVER['REQUEST_URI'] ?? '/';
-$path = parse_url($requestUri, PHP_URL_PATH);
-
-// Remove script name from path
-$scriptName = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
-$scriptDir = dirname($scriptName);
-if ($scriptDir !== '/' && strpos($path, $scriptDir) === 0) {
-    $path = substr($path, strlen($scriptDir));
-}
-$path = '/' . trim($path, '/');
-
-// Check if this is an API request
-$isApiRequest = (
-    isset($_GET['api']) || 
-    in_array($path, ['/register', '/login', '/send', '/messages', '/info']) ||
-    preg_match('#^/message/\d+#', $path)
-);
+$isApiRequest = isset($_GET['api']) || isset($_GET['action']);
 
 // ============================================================================
 // API HANDLER
@@ -177,9 +161,11 @@ if ($isApiRequest) {
         exit();
     }
     
+    $action = $_GET['action'] ?? 'info';
+    
     try {
         // GET /info
-        if (($path === '/info' || $path === '/' || $path === '') && $requestMethod === 'GET') {
+        if ($action === 'info' && $requestMethod === 'GET') {
             successResponse([
                 'domain' => DOMAIN,
                 'version' => VERSION,
@@ -190,7 +176,7 @@ if ($isApiRequest) {
         }
         
         // POST /register
-        elseif ($path === '/register' && $requestMethod === 'POST') {
+        elseif ($action === 'register' && $requestMethod === 'POST') {
             $input = json_decode(file_get_contents('php://input'), true);
             if (!$input) errorResponse('Invalid JSON input');
             
@@ -218,7 +204,7 @@ if ($isApiRequest) {
         }
         
         // POST /login
-        elseif ($path === '/login' && $requestMethod === 'POST') {
+        elseif ($action === 'login' && $requestMethod === 'POST') {
             $input = json_decode(file_get_contents('php://input'), true);
             if (!$input) errorResponse('Invalid JSON input');
             
@@ -250,7 +236,7 @@ if ($isApiRequest) {
         }
         
         // POST /send
-        elseif ($path === '/send' && $requestMethod === 'POST') {
+        elseif ($action === 'send' && $requestMethod === 'POST') {
             $authUser = getAuthUser();
             if (!$authUser) errorResponse('Unauthorized', 401);
             
@@ -280,69 +266,83 @@ if ($isApiRequest) {
             successResponse(['message' => 'Message sent successfully', 'message_id' => $db->lastInsertId()]);
         }
         
-        // GET /messages
-        elseif ($path === '/messages' && $requestMethod === 'GET') {
+        // GET /messages (inbox, sent, or trash)
+        elseif ($action === 'messages' && $requestMethod === 'GET') {
             $authUser = getAuthUser();
             if (!$authUser) errorResponse('Unauthorized', 401);
             
             $type = $_GET['type'] ?? 'inbox';
-            $isDeleted = ($type === 'trash') ? 1 : 0;
-            
             $db = getDB();
-            $stmt = $db->prepare("
-                SELECT id, from_user, to_user, subject, created_at,
-                CASE WHEN encrypted_attachments IS NOT NULL AND encrypted_attachments != '' THEN 
-                    (LENGTH(encrypted_attachments) - LENGTH(REPLACE(encrypted_attachments, 'filename', ''))) / LENGTH('filename')
-                ELSE 0 END as attachments_count
-                FROM messages WHERE to_user = ? AND is_deleted = ? ORDER BY created_at DESC LIMIT 1000
-            ");
-            $stmt->execute([$authUser['email'], $isDeleted]);
+            
+            if ($type === 'sent') {
+                // Get sent messages
+                $stmt = $db->prepare("
+                    SELECT id, from_user, to_user, subject, created_at,
+                    CASE WHEN encrypted_attachments IS NOT NULL AND encrypted_attachments != '' THEN 
+                        (LENGTH(encrypted_attachments) - LENGTH(REPLACE(encrypted_attachments, 'filename', ''))) / LENGTH('filename')
+                    ELSE 0 END as attachments_count
+                    FROM messages WHERE from_user = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT 1000
+                ");
+                $stmt->execute([$authUser['email']]);
+            } else {
+                // Get inbox or trash messages
+                $isDeleted = ($type === 'trash') ? 1 : 0;
+                $stmt = $db->prepare("
+                    SELECT id, from_user, to_user, subject, created_at,
+                    CASE WHEN encrypted_attachments IS NOT NULL AND encrypted_attachments != '' THEN 
+                        (LENGTH(encrypted_attachments) - LENGTH(REPLACE(encrypted_attachments, 'filename', ''))) / LENGTH('filename')
+                    ELSE 0 END as attachments_count
+                    FROM messages WHERE to_user = ? AND is_deleted = ? ORDER BY created_at DESC LIMIT 1000
+                ");
+                $stmt->execute([$authUser['email'], $isDeleted]);
+            }
+            
             $messages = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            successResponse(['messages' => $messages, 'count' => count($messages)]);
+            successResponse(['messages' => $messages, 'count' => count($messages), 'type' => $type]);
         }
         
         // GET /message/{id}
-        elseif (preg_match('#^/message/(\d+)$#', $path, $matches) && $requestMethod === 'GET') {
+        elseif ($action === 'message' && isset($_GET['id']) && $requestMethod === 'GET') {
             $authUser = getAuthUser();
             if (!$authUser) errorResponse('Unauthorized', 401);
             
             $db = getDB();
-            $stmt = $db->prepare("SELECT * FROM messages WHERE id = ? AND to_user = ?");
-            $stmt->execute([$matches[1], $authUser['email']]);
+            $stmt = $db->prepare("SELECT * FROM messages WHERE id = ? AND (to_user = ? OR from_user = ?)");
+            $stmt->execute([$_GET['id'], $authUser['email'], $authUser['email']]);
             $message = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if (!$message) errorResponse('Message not found', 404);
             successResponse(['message' => $message]);
         }
         
-        // POST /message/{id}/trash
-        elseif (preg_match('#^/message/(\d+)/trash$#', $path, $matches) && $requestMethod === 'POST') {
+        // POST /trash - Move message to trash
+        elseif ($action === 'trash' && isset($_GET['id']) && $requestMethod === 'POST') {
             $authUser = getAuthUser();
             if (!$authUser) errorResponse('Unauthorized', 401);
             
             $db = getDB();
             $stmt = $db->prepare("UPDATE messages SET is_deleted = 1 WHERE id = ? AND to_user = ? AND is_deleted = 0");
-            $stmt->execute([$matches[1], $authUser['email']]);
+            $stmt->execute([$_GET['id'], $authUser['email']]);
             
             if ($stmt->rowCount() === 0) errorResponse('Message not found', 404);
             successResponse(['message' => 'Message moved to trash']);
         }
         
-        // DELETE /message/{id}
-        elseif (preg_match('#^/message/(\d+)$#', $path, $matches) && $requestMethod === 'DELETE') {
+        // DELETE /delete - Permanently delete message
+        elseif ($action === 'delete' && isset($_GET['id']) && $requestMethod === 'DELETE') {
             $authUser = getAuthUser();
             if (!$authUser) errorResponse('Unauthorized', 401);
             
             $db = getDB();
             $stmt = $db->prepare("DELETE FROM messages WHERE id = ? AND to_user = ? AND is_deleted = 1");
-            $stmt->execute([$matches[1], $authUser['email']]);
+            $stmt->execute([$_GET['id'], $authUser['email']]);
             
             if ($stmt->rowCount() === 0) errorResponse('Message not found', 404);
             successResponse(['message' => 'Message deleted permanently']);
         }
         
         else {
-            errorResponse("Endpoint not found: $path", 404);
+            errorResponse("Invalid action: $action", 404);
         }
     } catch (Exception $e) {
         error_log("API Error: " . $e->getMessage());
@@ -354,7 +354,15 @@ if ($isApiRequest) {
 // WEB INTERFACE
 // ============================================================================
 
-$currentUrl = 'https://' . DOMAIN . $scriptName;
+// Detect HTTPS - works with nginx, Apache, and proxies
+$isHttps = (
+    (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ||
+    (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ||
+    (isset($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on') ||
+    (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
+);
+$protocol = $isHttps ? 'https' : 'http';
+$currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'];
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -419,8 +427,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
         .font-semibold { font-weight: 600; }
         .w-full { width: 100%; }
         .hint { font-size: 12px; color: #57606a; margin-top: 0.25rem; }
-        .info-box { background: #ddf4ff; border: 1px solid #54aeff; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; }
-        .info-box-title { font-weight: 600; margin-bottom: 0.5rem; color: #0969da; }
+        .text-center { text-align: center; }
     </style>
 </head>
 <body>
@@ -432,14 +439,11 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
     </div>
 
     <div class="container">
-        <!-- Info Box -->
-        <div class="info-box">
-            <div class="info-box-title">✨ Connected!</div>
-            <div class="text-sm">This is a complete end-to-end encrypted mailing system running from a single PHP file. You're already connected to <strong><?php echo DOMAIN; ?></strong>. Just register or login to start sending encrypted messages!</div>
-        </div>
-
         <!-- Auth View -->
         <div id="authView" class="card">
+            <div class="text-center mb-4">
+                <span class="text-sm text-gray">Connected to: <strong><?php echo DOMAIN; ?></strong></span>
+            </div>
             <h2 class="text-xl font-semibold mb-4">Authentication</h2>
             <div class="flex gap-2 mb-4">
                 <button onclick="showRegister()" id="registerTab" class="btn btn-primary flex-1">Register</button>
@@ -491,6 +495,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
 
                 <div class="tab-nav">
                     <div class="tab active" onclick="switchTab('inbox')">📥 Inbox</div>
+                    <div class="tab" onclick="switchTab('sent')">📤 Sent</div>
                     <div class="tab" onclick="switchTab('trash')">🗑️ Trash</div>
                     <div class="tab" onclick="switchTab('compose')">✉️ Compose</div>
                 </div>
@@ -502,6 +507,15 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                         <button onclick="loadMessages('inbox')" class="btn btn-secondary">🔄 Refresh</button>
                     </div>
                     <div id="inboxMessages" class="message-list"></div>
+                </div>
+
+                <!-- Sent Tab -->
+                <div id="sentTab" class="tab-content hidden">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="font-semibold">Sent Messages</h3>
+                        <button onclick="loadMessages('sent')" class="btn btn-secondary">🔄 Refresh</button>
+                    </div>
+                    <div id="sentMessages" class="message-list"></div>
                 </div>
 
                 <!-- Trash Tab -->
@@ -658,7 +672,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     showNotification(data.message || 'Registration failed', 'error');
                 }
             } catch (error) {
-                showNotification('Registration failed', 'error');
+                showNotification('Registration failed: ' + error.message, 'error');
             }
         }
 
@@ -690,7 +704,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     showNotification(data.message || 'Login failed', 'error');
                 }
             } catch (error) {
-                showNotification('Login failed', 'error');
+                showNotification('Login failed: ' + error.message, 'error');
             }
         }
 
@@ -708,7 +722,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
             document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
             event.target.classList.add('active');
             document.getElementById(`${tab}Tab`).classList.remove('hidden');
-            if (tab === 'inbox' || tab === 'trash') loadMessages(tab);
+            if (tab === 'inbox' || tab === 'sent' || tab === 'trash') loadMessages(tab);
         }
 
         function handleAttachmentSelect(event) {
@@ -772,7 +786,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     showNotification(data.message || 'Failed to send message', 'error');
                 }
             } catch (error) {
-                showNotification('Failed to send message', 'error');
+                showNotification('Failed to send message: ' + error.message, 'error');
             }
         }
 
@@ -785,7 +799,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                 if (data.success) displayMessages(data.messages, type);
                 else showNotification('Failed to load messages', 'error');
             } catch (error) {
-                showNotification('Failed to load messages', 'error');
+                showNotification('Failed to load messages: ' + error.message, 'error');
             }
         }
 
@@ -795,17 +809,21 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                 container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">📭</div><p>No messages in ${type}</p></div>`;
                 return;
             }
-            container.innerHTML = messages.map(msg => `
-                <div class="message-item" onclick="viewMessage(${msg.id}, '${type}')">
-                    <div class="flex justify-between items-center mb-2">
-                        <span class="font-semibold">From: ${msg.from_user}</span>
-                        <span class="text-xs text-gray">${new Date(msg.created_at).toLocaleString()}</span>
+            
+            container.innerHTML = messages.map(msg => {
+                const displayUser = type === 'sent' ? `To: ${msg.to_user}` : `From: ${msg.from_user}`;
+                return `
+                    <div class="message-item" onclick="viewMessage(${msg.id}, '${type}')">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="font-semibold">${displayUser}</span>
+                            <span class="text-xs text-gray">${new Date(msg.created_at).toLocaleString()}</span>
+                        </div>
+                        <div class="font-semibold text-sm mb-1">📧 ${msg.subject}</div>
+                        <div class="text-xs text-gray">🔒 Encrypted - Click to decrypt</div>
+                        ${msg.attachments_count > 0 ? `<div class="text-xs text-gray mt-1">📎 ${msg.attachments_count} attachment(s)</div>` : ''}
                     </div>
-                    <div class="font-semibold text-sm mb-1">📧 ${msg.subject}</div>
-                    <div class="text-xs text-gray">🔒 Encrypted - Click to decrypt</div>
-                    ${msg.attachments_count > 0 ? `<div class="text-xs text-gray mt-1">📎 ${msg.attachments_count} attachment(s)</div>` : ''}
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
 
         async function viewMessage(id, type) {
@@ -816,7 +834,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                 const data = await response.json();
                 if (data.success) showDecryptModal(data.message, type);
             } catch (error) {
-                showNotification('Failed to load message', 'error');
+                showNotification('Failed to load message: ' + error.message, 'error');
             }
         }
 
@@ -861,6 +879,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     const content = `
                         <div class="mb-4">
                             <strong>From:</strong> ${data.message.from_user}<br>
+                            <strong>To:</strong> ${data.message.to_user}<br>
                             <strong>Subject:</strong> ${data.message.subject}<br>
                             <strong>Date:</strong> ${new Date(data.message.created_at).toLocaleString()}
                         </div>
@@ -872,7 +891,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                         </div>
                     `;
                     closeModal(document.querySelector('.close-btn'));
-                    showModal(`✉️ ${data.message.from_user}`, content);
+                    showModal(`✉️ Message`, content);
                 }
             } catch (error) {
                 showNotification(error.message || 'Decryption failed', 'error');
@@ -892,7 +911,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     loadMessages('inbox');
                 }
             } catch (error) {
-                showNotification('Failed to move message', 'error');
+                showNotification('Failed to move message: ' + error.message, 'error');
             }
         }
 
@@ -909,7 +928,7 @@ $currentUrl = 'https://' . DOMAIN . $scriptName;
                     loadMessages('trash');
                 }
             } catch (error) {
-                showNotification('Failed to delete message', 'error');
+                showNotification('Failed to delete message: ' + error.message, 'error');
             }
         }
     </script>
