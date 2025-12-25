@@ -1,14 +1,14 @@
 <?php
 /**
  * xsukax E2EE Local Mailing System - Single File Application
- * Version: 1.0.0
+ * Version: 2.0.0 - Cookie-Based Authentication
  * Author: xsukax
  * 
  * Complete end-to-end encrypted mailing system in a single PHP file
  * - Zero-knowledge architecture with AES-256-GCM encryption
+ * - Cookie-based authentication (works on ALL hosting providers)
  * - Works on any domain with nginx or Apache
  * - No configuration required - just upload and run!
- * - Serves both API and web interface from one file
  */
 
 // Error reporting configuration
@@ -17,11 +17,46 @@ ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 ini_set('error_log', __DIR__ . '/error.log');
 
-// Configuration - Automatically adapts to any domain
+// Global error handler for API requests
+function handleShutdown() {
+    $error = error_get_last();
+    if ($error && in_array($error['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+        if (isset($_GET['api']) || isset($_GET['action'])) {
+            header('Content-Type: application/json; charset=utf-8');
+            http_response_code(500);
+            echo json_encode([
+                'success' => false,
+                'message' => 'Internal server error',
+                'error' => $error['message']
+            ]);
+        }
+    }
+}
+register_shutdown_function('handleShutdown');
+
+// Session configuration - Secure cookies
+ini_set('session.cookie_httponly', 1);
+ini_set('session.cookie_samesite', 'Lax');
+ini_set('session.use_strict_mode', 1);
+
+// Detect HTTPS
+$isHttps = (
+    (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ||
+    (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ||
+    (isset($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on') ||
+    (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
+);
+
+if ($isHttps) {
+    ini_set('session.cookie_secure', 1);
+}
+
+session_start();
+
+// Configuration
 define('DB_FILE', __DIR__ . '/xsukax_mail.db');
-define('JWT_SECRET', 'xsukax-e2ee-mail-system-' . hash('sha256', __DIR__ . $_SERVER['HTTP_HOST']));
 define('DOMAIN', $_SERVER['HTTP_HOST'] ?? 'localhost');
-define('VERSION', '1.0.0');
+define('VERSION', '2.0.0');
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -29,6 +64,11 @@ define('VERSION', '1.0.0');
 
 function initDatabase() {
     try {
+        if (!is_writable(__DIR__)) {
+            error_log("Database directory is not writable: " . __DIR__);
+            return null;
+        }
+        
         $db = new PDO('sqlite:' . DB_FILE);
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $db->setAttribute(PDO::ATTR_TIMEOUT, 10);
@@ -82,37 +122,45 @@ function getDB() {
     return $db;
 }
 
-function generateJWT($userId, $email) {
-    $header = base64_encode(json_encode(['typ' => 'JWT', 'alg' => 'HS256']));
-    $payload = base64_encode(json_encode([
-        'user_id' => $userId,
-        'email' => $email,
-        'domain' => DOMAIN,
-        'iat' => time(),
-        'exp' => time() + (7 * 24 * 60 * 60)
-    ]));
-    $signature = hash_hmac('sha256', "$header.$payload", JWT_SECRET, true);
-    $signature = base64_encode($signature);
-    return "$header.$payload.$signature";
+function isLoggedIn() {
+    return isset($_SESSION['user_id']) && isset($_SESSION['email']);
 }
 
-function verifyJWT($token) {
-    $parts = explode('.', $token);
-    if (count($parts) !== 3) return false;
-    list($header, $payload, $signature) = $parts;
-    $validSignature = base64_encode(hash_hmac('sha256', "$header.$payload", JWT_SECRET, true));
-    if ($signature !== $validSignature) return false;
-    $payloadData = json_decode(base64_decode($payload), true);
-    if (!$payloadData || $payloadData['exp'] < time()) return false;
-    return $payloadData;
+function requireAuth() {
+    if (!isLoggedIn()) {
+        errorResponse('Unauthorized - Please login', 401);
+    }
 }
 
-function getAuthUser() {
-    $headers = getallheaders();
-    if (!$headers) $headers = [];
-    $authHeader = $headers['Authorization'] ?? $headers['authorization'] ?? '';
-    if (!preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) return null;
-    return verifyJWT($matches[1]);
+function getCurrentUser() {
+    if (!isLoggedIn()) {
+        return null;
+    }
+    return [
+        'user_id' => $_SESSION['user_id'],
+        'email' => $_SESSION['email'],
+        'username' => $_SESSION['username'] ?? '',
+        'domain' => $_SESSION['domain'] ?? DOMAIN
+    ];
+}
+
+function loginUser($user) {
+    $_SESSION['user_id'] = $user['id'];
+    $_SESSION['email'] = $user['email'];
+    $_SESSION['username'] = $user['username'];
+    $_SESSION['domain'] = $user['domain'];
+    $_SESSION['login_time'] = time();
+    
+    // Regenerate session ID to prevent session fixation
+    session_regenerate_id(true);
+}
+
+function logoutUser() {
+    $_SESSION = array();
+    if (isset($_COOKIE[session_name()])) {
+        setcookie(session_name(), '', time() - 3600, '/');
+    }
+    session_destroy();
 }
 
 function validateEmail($email) {
@@ -153,7 +201,8 @@ if ($isApiRequest) {
     // CORS Headers
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-    header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
+    header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+    header('Access-Control-Allow-Credentials: true');
     header('Access-Control-Max-Age: 3600');
     
     if ($requestMethod === 'OPTIONS') {
@@ -171,8 +220,22 @@ if ($isApiRequest) {
                 'version' => VERSION,
                 'system' => 'xsukax E2EE Local Mailing System',
                 'encryption' => 'AES-256-GCM (client-side)',
-                'timestamp' => date('c')
+                'auth' => 'cookie-based',
+                'timestamp' => date('c'),
+                'logged_in' => isLoggedIn()
             ]);
+        }
+        
+        // GET /session - Check session status
+        elseif ($action === 'session' && $requestMethod === 'GET') {
+            if (isLoggedIn()) {
+                successResponse([
+                    'logged_in' => true,
+                    'user' => getCurrentUser()
+                ]);
+            } else {
+                successResponse(['logged_in' => false]);
+            }
         }
         
         // POST /register
@@ -184,7 +247,7 @@ if ($isApiRequest) {
             $password = $input['password'] ?? '';
             
             if (empty($username) || empty($password)) errorResponse('Username and password are required');
-            if (!preg_match('/^[a-zA-Z0-9_-]{3,30}$/', $username)) errorResponse('Username must be 3-30 characters');
+            if (!preg_match('/^[a-zA-Z0-9_-]{3,30}$/', $username)) errorResponse('Username must be 3-30 characters (alphanumeric, dash, underscore only)');
             if (strlen($password) < 6) errorResponse('Password must be at least 6 characters');
             
             $email = $username . '@' . DOMAIN;
@@ -192,6 +255,8 @@ if ($isApiRequest) {
             
             try {
                 $db = getDB();
+                if (!$db) errorResponse('Database connection failed', 500);
+                
                 $stmt = $db->prepare("INSERT INTO users (username, domain, email, password_hash) VALUES (?, ?, ?, ?)");
                 $stmt->execute([$username, DOMAIN, $email, $passwordHash]);
                 successResponse(['message' => 'Registration successful', 'email' => $email]);
@@ -199,6 +264,7 @@ if ($isApiRequest) {
                 if (strpos($e->getMessage(), 'UNIQUE constraint failed') !== false) {
                     errorResponse('Username already exists');
                 }
+                error_log("Registration error: " . $e->getMessage());
                 errorResponse('Registration failed', 500);
             }
         }
@@ -214,18 +280,21 @@ if ($isApiRequest) {
             if (!validateEmail($email) || empty($password)) errorResponse('Invalid credentials', 401);
             
             $db = getDB();
+            if (!$db) errorResponse('Database connection failed', 500);
+            
             $stmt = $db->prepare("SELECT id, email, password_hash, username, domain FROM users WHERE email = ?");
             $stmt->execute([$email]);
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if (!$user || !password_verify($password, $user['password_hash'])) {
-                usleep(500000);
+                usleep(500000); // Prevent timing attacks
                 errorResponse('Invalid credentials', 401);
             }
             
-            $token = generateJWT($user['id'], $user['email']);
+            loginUser($user);
+            
             successResponse([
-                'token' => $token,
+                'message' => 'Login successful',
                 'user' => [
                     'id' => $user['id'],
                     'email' => $user['email'],
@@ -235,10 +304,16 @@ if ($isApiRequest) {
             ]);
         }
         
+        // POST /logout
+        elseif ($action === 'logout' && $requestMethod === 'POST') {
+            logoutUser();
+            successResponse(['message' => 'Logout successful']);
+        }
+        
         // POST /send
         elseif ($action === 'send' && $requestMethod === 'POST') {
-            $authUser = getAuthUser();
-            if (!$authUser) errorResponse('Unauthorized', 401);
+            requireAuth();
+            $currentUser = getCurrentUser();
             
             $input = json_decode(file_get_contents('php://input'), true);
             if (!$input) errorResponse('Invalid JSON input');
@@ -252,6 +327,8 @@ if ($isApiRequest) {
             if (empty($subject) || empty($encryptedContent)) errorResponse('Subject and content are required');
             
             $db = getDB();
+            if (!$db) errorResponse('Database connection failed', 500);
+            
             $stmt = $db->prepare("SELECT id FROM users WHERE email = ?");
             $stmt->execute([$to]);
             if (!$stmt->fetch()) errorResponse('Recipient does not exist');
@@ -261,91 +338,128 @@ if ($isApiRequest) {
                 $attachmentsJson = json_encode($encryptedAttachments);
             }
             
-            $stmt = $db->prepare("INSERT INTO messages (from_user, to_user, subject, encrypted_content, encrypted_attachments) VALUES (?, ?, ?, ?, ?)");
-            $stmt->execute([$authUser['email'], $to, $subject, $encryptedContent, $attachmentsJson]);
-            successResponse(['message' => 'Message sent successfully', 'message_id' => $db->lastInsertId()]);
+            try {
+                $stmt = $db->prepare("INSERT INTO messages (from_user, to_user, subject, encrypted_content, encrypted_attachments) VALUES (?, ?, ?, ?, ?)");
+                $stmt->execute([$currentUser['email'], $to, $subject, $encryptedContent, $attachmentsJson]);
+                successResponse(['message' => 'Message sent successfully', 'message_id' => $db->lastInsertId()]);
+            } catch (PDOException $e) {
+                error_log("Send message error: " . $e->getMessage());
+                errorResponse('Failed to send message', 500);
+            }
         }
         
         // GET /messages (inbox, sent, or trash)
         elseif ($action === 'messages' && $requestMethod === 'GET') {
-            $authUser = getAuthUser();
-            if (!$authUser) errorResponse('Unauthorized', 401);
+            requireAuth();
+            $currentUser = getCurrentUser();
             
             $type = $_GET['type'] ?? 'inbox';
             $db = getDB();
+            if (!$db) errorResponse('Database connection failed', 500);
             
-            if ($type === 'sent') {
-                // Get sent messages
-                $stmt = $db->prepare("
-                    SELECT id, from_user, to_user, subject, created_at,
-                    CASE WHEN encrypted_attachments IS NOT NULL AND encrypted_attachments != '' THEN 
-                        (LENGTH(encrypted_attachments) - LENGTH(REPLACE(encrypted_attachments, 'filename', ''))) / LENGTH('filename')
-                    ELSE 0 END as attachments_count
-                    FROM messages WHERE from_user = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT 1000
-                ");
-                $stmt->execute([$authUser['email']]);
-            } else {
-                // Get inbox or trash messages
-                $isDeleted = ($type === 'trash') ? 1 : 0;
-                $stmt = $db->prepare("
-                    SELECT id, from_user, to_user, subject, created_at,
-                    CASE WHEN encrypted_attachments IS NOT NULL AND encrypted_attachments != '' THEN 
-                        (LENGTH(encrypted_attachments) - LENGTH(REPLACE(encrypted_attachments, 'filename', ''))) / LENGTH('filename')
-                    ELSE 0 END as attachments_count
-                    FROM messages WHERE to_user = ? AND is_deleted = ? ORDER BY created_at DESC LIMIT 1000
-                ");
-                $stmt->execute([$authUser['email'], $isDeleted]);
+            try {
+                if ($type === 'sent') {
+                    $stmt = $db->prepare("
+                        SELECT id, from_user, to_user, subject, created_at, encrypted_attachments
+                        FROM messages WHERE from_user = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT 1000
+                    ");
+                    $stmt->execute([$currentUser['email']]);
+                } else {
+                    $isDeleted = ($type === 'trash') ? 1 : 0;
+                    $stmt = $db->prepare("
+                        SELECT id, from_user, to_user, subject, created_at, encrypted_attachments
+                        FROM messages WHERE to_user = ? AND is_deleted = ? ORDER BY created_at DESC LIMIT 1000
+                    ");
+                    $stmt->execute([$currentUser['email'], $isDeleted]);
+                }
+                
+                $messages = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+                // Calculate attachment count in PHP
+                foreach ($messages as &$message) {
+                    $attachmentCount = 0;
+                    if (!empty($message['encrypted_attachments'])) {
+                        $attachments = json_decode($message['encrypted_attachments'], true);
+                        $attachmentCount = is_array($attachments) ? count($attachments) : 0;
+                    }
+                    $message['attachments_count'] = $attachmentCount;
+                    unset($message['encrypted_attachments']);
+                }
+                unset($message);
+                
+                successResponse(['messages' => $messages, 'count' => count($messages), 'type' => $type]);
+            } catch (PDOException $e) {
+                error_log("Messages query error: " . $e->getMessage());
+                errorResponse('Failed to fetch messages', 500);
             }
-            
-            $messages = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            successResponse(['messages' => $messages, 'count' => count($messages), 'type' => $type]);
         }
         
         // GET /message/{id}
         elseif ($action === 'message' && isset($_GET['id']) && $requestMethod === 'GET') {
-            $authUser = getAuthUser();
-            if (!$authUser) errorResponse('Unauthorized', 401);
+            requireAuth();
+            $currentUser = getCurrentUser();
             
             $db = getDB();
-            $stmt = $db->prepare("SELECT * FROM messages WHERE id = ? AND (to_user = ? OR from_user = ?)");
-            $stmt->execute([$_GET['id'], $authUser['email'], $authUser['email']]);
-            $message = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$db) errorResponse('Database connection failed', 500);
             
-            if (!$message) errorResponse('Message not found', 404);
-            successResponse(['message' => $message]);
+            try {
+                $stmt = $db->prepare("SELECT * FROM messages WHERE id = ? AND (to_user = ? OR from_user = ?)");
+                $stmt->execute([$_GET['id'], $currentUser['email'], $currentUser['email']]);
+                $message = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if (!$message) errorResponse('Message not found', 404);
+                successResponse(['message' => $message]);
+            } catch (PDOException $e) {
+                error_log("Get message error: " . $e->getMessage());
+                errorResponse('Failed to fetch message', 500);
+            }
         }
         
         // POST /trash - Move message to trash
         elseif ($action === 'trash' && isset($_GET['id']) && $requestMethod === 'POST') {
-            $authUser = getAuthUser();
-            if (!$authUser) errorResponse('Unauthorized', 401);
+            requireAuth();
+            $currentUser = getCurrentUser();
             
             $db = getDB();
-            $stmt = $db->prepare("UPDATE messages SET is_deleted = 1 WHERE id = ? AND to_user = ? AND is_deleted = 0");
-            $stmt->execute([$_GET['id'], $authUser['email']]);
+            if (!$db) errorResponse('Database connection failed', 500);
             
-            if ($stmt->rowCount() === 0) errorResponse('Message not found', 404);
-            successResponse(['message' => 'Message moved to trash']);
+            try {
+                $stmt = $db->prepare("UPDATE messages SET is_deleted = 1 WHERE id = ? AND to_user = ? AND is_deleted = 0");
+                $stmt->execute([$_GET['id'], $currentUser['email']]);
+                
+                if ($stmt->rowCount() === 0) errorResponse('Message not found', 404);
+                successResponse(['message' => 'Message moved to trash']);
+            } catch (PDOException $e) {
+                error_log("Trash message error: " . $e->getMessage());
+                errorResponse('Failed to move message to trash', 500);
+            }
         }
         
         // DELETE /delete - Permanently delete message
         elseif ($action === 'delete' && isset($_GET['id']) && $requestMethod === 'DELETE') {
-            $authUser = getAuthUser();
-            if (!$authUser) errorResponse('Unauthorized', 401);
+            requireAuth();
+            $currentUser = getCurrentUser();
             
             $db = getDB();
-            $stmt = $db->prepare("DELETE FROM messages WHERE id = ? AND to_user = ? AND is_deleted = 1");
-            $stmt->execute([$_GET['id'], $authUser['email']]);
+            if (!$db) errorResponse('Database connection failed', 500);
             
-            if ($stmt->rowCount() === 0) errorResponse('Message not found', 404);
-            successResponse(['message' => 'Message deleted permanently']);
+            try {
+                $stmt = $db->prepare("DELETE FROM messages WHERE id = ? AND to_user = ? AND is_deleted = 1");
+                $stmt->execute([$_GET['id'], $currentUser['email']]);
+                
+                if ($stmt->rowCount() === 0) errorResponse('Message not found or not in trash', 404);
+                successResponse(['message' => 'Message deleted permanently']);
+            } catch (PDOException $e) {
+                error_log("Delete message error: " . $e->getMessage());
+                errorResponse('Failed to delete message', 500);
+            }
         }
         
         else {
             errorResponse("Invalid action: $action", 404);
         }
     } catch (Exception $e) {
-        error_log("API Error: " . $e->getMessage());
+        error_log("API Error: " . $e->getMessage() . " | Trace: " . $e->getTraceAsString());
         errorResponse('Internal server error', 500);
     }
 }
@@ -354,13 +468,6 @@ if ($isApiRequest) {
 // WEB INTERFACE
 // ============================================================================
 
-// Detect HTTPS - works with nginx, Apache, and proxies
-$isHttps = (
-    (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ||
-    (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') ||
-    (isset($_SERVER['HTTP_X_FORWARDED_SSL']) && $_SERVER['HTTP_X_FORWARDED_SSL'] === 'on') ||
-    (isset($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
-);
 $protocol = $isHttps ? 'https' : 'http';
 $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'];
 ?>
@@ -451,38 +558,38 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             </div>
 
             <!-- Register Form -->
-            <div id="registerForm">
+            <form id="registerForm" onsubmit="event.preventDefault(); register();">
                 <div class="form-group">
                     <label class="label">Username</label>
                     <div class="flex gap-2 items-center">
-                        <input type="text" id="regUsername" class="input flex-1" placeholder="username">
+                        <input type="text" id="regUsername" class="input flex-1" placeholder="username" autocomplete="username">
                         <span class="text-gray">@<?php echo DOMAIN; ?></span>
                     </div>
                     <p class="hint">Choose a unique username (3-30 characters, alphanumeric only)</p>
                 </div>
                 <div class="form-group">
                     <label class="label">Password</label>
-                    <input type="password" id="regPassword" class="input" placeholder="Enter a strong password">
+                    <input type="password" id="regPassword" class="input" placeholder="Enter a strong password" autocomplete="new-password">
                     <p class="hint">Minimum 6 characters</p>
                 </div>
-                <button onclick="register()" class="btn btn-primary w-full">Create Account</button>
-            </div>
+                <button type="submit" class="btn btn-primary w-full">Create Account</button>
+            </form>
 
             <!-- Login Form -->
-            <div id="loginForm" class="hidden">
+            <form id="loginForm" class="hidden" onsubmit="event.preventDefault(); login();">
                 <div class="form-group">
                     <label class="label">Username</label>
                     <div class="flex gap-2 items-center">
-                        <input type="text" id="loginUsername" class="input flex-1" placeholder="username">
+                        <input type="text" id="loginUsername" class="input flex-1" placeholder="username" autocomplete="username">
                         <span class="text-gray">@<?php echo DOMAIN; ?></span>
                     </div>
                 </div>
                 <div class="form-group">
                     <label class="label">Password</label>
-                    <input type="password" id="loginPassword" class="input" placeholder="Enter your password">
+                    <input type="password" id="loginPassword" class="input" placeholder="Enter your password" autocomplete="current-password">
                 </div>
-                <button onclick="login()" class="btn btn-primary w-full">Login</button>
-            </div>
+                <button type="submit" class="btn btn-primary w-full">Login</button>
+            </form>
         </div>
 
         <!-- Mail View -->
@@ -529,33 +636,35 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
 
                 <!-- Compose Tab -->
                 <div id="composeTab" class="tab-content hidden">
-                    <h3 class="font-semibold mb-4">Compose New Message</h3>
-                    <div class="form-group">
-                        <label class="label">Send To</label>
-                        <div class="flex gap-2 items-center">
-                            <input type="text" id="composeTo" class="input flex-1" placeholder="recipient username">
-                            <span class="text-gray">@<?php echo DOMAIN; ?></span>
+                    <form onsubmit="event.preventDefault(); sendMessage();">
+                        <h3 class="font-semibold mb-4">Compose New Message</h3>
+                        <div class="form-group">
+                            <label class="label">Send To</label>
+                            <div class="flex gap-2 items-center">
+                                <input type="text" id="composeTo" class="input flex-1" placeholder="recipient username">
+                                <span class="text-gray">@<?php echo DOMAIN; ?></span>
+                            </div>
                         </div>
-                    </div>
-                    <div class="form-group">
-                        <label class="label">Subject</label>
-                        <input type="text" id="composeSubject" class="input" placeholder="Message subject">
-                    </div>
-                    <div class="form-group">
-                        <label class="label">Encryption Key (Password) 🔐</label>
-                        <input type="password" id="composeKey" class="input" placeholder="Enter encryption password">
-                        <p class="hint">Share this password securely with the recipient</p>
-                    </div>
-                    <div class="form-group">
-                        <label class="label">Message</label>
-                        <textarea id="composeContent" class="textarea" placeholder="Type your encrypted message..."></textarea>
-                    </div>
-                    <div class="form-group">
-                        <label class="label">Attachments (Optional) 📎</label>
-                        <input type="file" id="composeAttachments" class="input" multiple onchange="handleAttachmentSelect(event)">
-                        <div id="attachmentList" class="attachment-list"></div>
-                    </div>
-                    <button onclick="sendMessage()" class="btn btn-primary">🔒 Send Encrypted Message</button>
+                        <div class="form-group">
+                            <label class="label">Subject</label>
+                            <input type="text" id="composeSubject" class="input" placeholder="Message subject">
+                        </div>
+                        <div class="form-group">
+                            <label class="label">Encryption Key (Password) 🔐</label>
+                            <input type="password" id="composeKey" class="input" placeholder="Enter encryption password" autocomplete="off">
+                            <p class="hint">Share this password securely with the recipient</p>
+                        </div>
+                        <div class="form-group">
+                            <label class="label">Message</label>
+                            <textarea id="composeContent" class="textarea" placeholder="Type your encrypted message..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="label">Attachments (Optional) 📎</label>
+                            <input type="file" id="composeAttachments" class="input" multiple onchange="handleAttachmentSelect(event)">
+                            <div id="attachmentList" class="attachment-list"></div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">🔒 Send Encrypted Message</button>
+                    </form>
                 </div>
             </div>
         </div>
@@ -564,9 +673,11 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
     <script>
         const API_URL = '<?php echo $currentUrl; ?>';
         const DOMAIN = '<?php echo DOMAIN; ?>';
-        let AUTH_TOKEN = '';
         let CURRENT_USER = null;
         let selectedAttachments = [];
+
+        // Check session on page load
+        window.addEventListener('DOMContentLoaded', checkSession);
 
         function showNotification(message, type = 'info') {
             const notification = document.createElement('div');
@@ -612,6 +723,29 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             document.getElementById('registerTab').classList.add('btn-secondary');
             document.getElementById('loginForm').classList.remove('hidden');
             document.getElementById('registerForm').classList.add('hidden');
+        }
+
+        async function checkSession() {
+            try {
+                const response = await fetch(`${API_URL}?api=1&action=session`, {
+                    credentials: 'same-origin'
+                });
+                const data = await response.json();
+                if (data.success && data.logged_in) {
+                    CURRENT_USER = data.user;
+                    showMailView();
+                }
+            } catch (error) {
+                console.log('No active session');
+            }
+        }
+
+        function showMailView() {
+            document.getElementById('authView').classList.add('hidden');
+            document.getElementById('mailView').classList.remove('hidden');
+            document.getElementById('userInfo').classList.remove('hidden');
+            document.getElementById('userInfo').textContent = `Logged in as ${CURRENT_USER.email}`;
+            loadMessages('inbox');
         }
 
         async function deriveKey(password, salt) {
@@ -661,6 +795,7 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
                 const response = await fetch(`${API_URL}?api=1&action=register`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
                     body: JSON.stringify({ username, password })
                 });
                 const data = await response.json();
@@ -688,18 +823,14 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
                 const response = await fetch(`${API_URL}?api=1&action=login`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
                     body: JSON.stringify({ email, password })
                 });
                 const data = await response.json();
                 if (data.success) {
-                    AUTH_TOKEN = data.token;
                     CURRENT_USER = data.user;
-                    document.getElementById('authView').classList.add('hidden');
-                    document.getElementById('mailView').classList.remove('hidden');
-                    document.getElementById('userInfo').classList.remove('hidden');
-                    document.getElementById('userInfo').textContent = `Logged in as ${CURRENT_USER.email}`;
                     showNotification('✅ Login successful!', 'success');
-                    loadMessages('inbox');
+                    showMailView();
                 } else {
                     showNotification(data.message || 'Login failed', 'error');
                 }
@@ -708,13 +839,20 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             }
         }
 
-        function logout() {
-            AUTH_TOKEN = '';
-            CURRENT_USER = null;
-            document.getElementById('mailView').classList.add('hidden');
-            document.getElementById('authView').classList.remove('hidden');
-            document.getElementById('userInfo').classList.add('hidden');
-            showNotification('Logged out successfully', 'success');
+        async function logout() {
+            try {
+                await fetch(`${API_URL}?api=1&action=logout`, {
+                    method: 'POST',
+                    credentials: 'same-origin'
+                });
+                CURRENT_USER = null;
+                document.getElementById('mailView').classList.add('hidden');
+                document.getElementById('authView').classList.remove('hidden');
+                document.getElementById('userInfo').classList.add('hidden');
+                showNotification('Logged out successfully', 'success');
+            } catch (error) {
+                showNotification('Logout failed: ' + error.message, 'error');
+            }
         }
 
         function switchTab(tab) {
@@ -735,7 +873,7 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             list.innerHTML = selectedAttachments.map((file, index) => `
                 <div class="attachment-item">
                     <span>📎 ${file.name} (${(file.size / 1024).toFixed(2)} KB)</span>
-                    <button onclick="removeAttachment(${index})">×</button>
+                    <button type="button" onclick="removeAttachment(${index})">×</button>
                 </div>
             `).join('');
         }
@@ -769,7 +907,8 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
                 }
                 const response = await fetch(`${API_URL}?api=1&action=send`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${AUTH_TOKEN}` },
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
                     body: JSON.stringify({ to, subject, encrypted_content: encryptedContent, encrypted_attachments: encryptedAttachments })
                 });
                 const data = await response.json();
@@ -793,11 +932,14 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
         async function loadMessages(type) {
             try {
                 const response = await fetch(`${API_URL}?api=1&action=messages&type=${type}`, {
-                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+                    credentials: 'same-origin'
                 });
                 const data = await response.json();
-                if (data.success) displayMessages(data.messages, type);
-                else showNotification('Failed to load messages', 'error');
+                if (data.success) {
+                    displayMessages(data.messages, type);
+                } else {
+                    showNotification(data.message || 'Failed to load messages', 'error');
+                }
             } catch (error) {
                 showNotification('Failed to load messages: ' + error.message, 'error');
             }
@@ -806,7 +948,7 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
         function displayMessages(messages, type) {
             const container = document.getElementById(`${type}Messages`);
             if (!messages || messages.length === 0) {
-                container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">📭</div><p>No messages in ${type}</p></div>`;
+                container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">🔭</div><p>No messages in ${type}</p></div>`;
                 return;
             }
             
@@ -819,7 +961,7 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
                             <span class="text-xs text-gray">${new Date(msg.created_at).toLocaleString()}</span>
                         </div>
                         <div class="font-semibold text-sm mb-1">📧 ${msg.subject}</div>
-                        <div class="text-xs text-gray">🔒 Encrypted - Click to decrypt</div>
+                        <div class="text-xs text-gray">🔐 Encrypted - Click to decrypt</div>
                         ${msg.attachments_count > 0 ? `<div class="text-xs text-gray mt-1">📎 ${msg.attachments_count} attachment(s)</div>` : ''}
                     </div>
                 `;
@@ -829,10 +971,14 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
         async function viewMessage(id, type) {
             try {
                 const response = await fetch(`${API_URL}?api=1&action=message&id=${id}`, {
-                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+                    credentials: 'same-origin'
                 });
                 const data = await response.json();
-                if (data.success) showDecryptModal(data.message, type);
+                if (data.success) {
+                    showDecryptModal(data.message, type);
+                } else {
+                    showNotification(data.message || 'Failed to load message', 'error');
+                }
             } catch (error) {
                 showNotification('Failed to load message: ' + error.message, 'error');
             }
@@ -840,15 +986,17 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
 
         function showDecryptModal(message, type) {
             const content = `
-                <div class="form-group">
-                    <label class="label">🔐 Enter decryption key</label>
-                    <input type="password" id="decryptKey" class="input" placeholder="Enter encryption password">
-                </div>
-                <div class="flex gap-2">
-                    <button onclick="decryptMessage(${message.id}, '${type}')" class="btn btn-primary">🔓 Decrypt</button>
-                    ${type === 'inbox' ? `<button onclick="moveToTrash(${message.id})" class="btn btn-danger">🗑️ Trash</button>` : ''}
-                    ${type === 'trash' ? `<button onclick="permanentDelete(${message.id})" class="btn btn-danger">⚠️ Delete</button>` : ''}
-                </div>
+                <form onsubmit="event.preventDefault(); decryptMessage(${message.id}, '${type}');">
+                    <div class="form-group">
+                        <label class="label">🔐 Enter decryption key</label>
+                        <input type="password" id="decryptKey" class="input" placeholder="Enter encryption password" autocomplete="off">
+                    </div>
+                    <div class="flex gap-2">
+                        <button type="submit" class="btn btn-primary">🔓 Decrypt</button>
+                        ${type === 'inbox' ? `<button type="button" onclick="moveToTrash(${message.id})" class="btn btn-danger">🗑️ Trash</button>` : ''}
+                        ${type === 'trash' ? `<button type="button" onclick="permanentDelete(${message.id})" class="btn btn-danger">⚠️ Delete</button>` : ''}
+                    </div>
+                </form>
             `;
             showModal(`📨 ${message.from_user} - ${message.subject}`, content);
         }
@@ -861,7 +1009,7 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             }
             try {
                 const response = await fetch(`${API_URL}?api=1&action=message&id=${id}`, {
-                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+                    credentials: 'same-origin'
                 });
                 const data = await response.json();
                 if (data.success) {
@@ -892,6 +1040,8 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
                     `;
                     closeModal(document.querySelector('.close-btn'));
                     showModal(`✉️ Message`, content);
+                } else {
+                    showNotification(data.message || 'Failed to load message', 'error');
                 }
             } catch (error) {
                 showNotification(error.message || 'Decryption failed', 'error');
@@ -902,13 +1052,15 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             try {
                 const response = await fetch(`${API_URL}?api=1&action=trash&id=${id}`, {
                     method: 'POST',
-                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+                    credentials: 'same-origin'
                 });
                 const data = await response.json();
                 if (data.success) {
                     showNotification('Message moved to trash', 'success');
                     closeModal(document.querySelector('.close-btn'));
                     loadMessages('inbox');
+                } else {
+                    showNotification(data.message || 'Failed to move message', 'error');
                 }
             } catch (error) {
                 showNotification('Failed to move message: ' + error.message, 'error');
@@ -919,13 +1071,15 @@ $currentUrl = $protocol . '://' . $_SERVER['HTTP_HOST'] . $_SERVER['SCRIPT_NAME'
             try {
                 const response = await fetch(`${API_URL}?api=1&action=delete&id=${id}`, {
                     method: 'DELETE',
-                    headers: { 'Authorization': `Bearer ${AUTH_TOKEN}` }
+                    credentials: 'same-origin'
                 });
                 const data = await response.json();
                 if (data.success) {
                     showNotification('Message deleted permanently', 'success');
                     closeModal(document.querySelector('.close-btn'));
                     loadMessages('trash');
+                } else {
+                    showNotification(data.message || 'Failed to delete message', 'error');
                 }
             } catch (error) {
                 showNotification('Failed to delete message: ' + error.message, 'error');
