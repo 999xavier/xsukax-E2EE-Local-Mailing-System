@@ -6,6 +6,8 @@
 
 A complete end-to-end encrypted local mailing system delivered as a single PHP file. Built with zero-knowledge architecture principles, this application ensures that your communications remain private and secure through client-side AES-256-GCM encryption.
 
+**Demo:** [https://xsukax.ct.ws/mail](https://xsukax.ct.ws/mail)
+
 ## 🎯 Project Overview
 
 **xsukax E2EE Local Mailing System** is a self-contained, privacy-focused email application designed for organizations and individuals who require secure internal communications without relying on third-party email providers. The entire system—including the web interface, API endpoints, and database management - is encapsulated in a single `index.php` file, making deployment remarkably simple.
